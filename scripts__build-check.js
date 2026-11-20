@@ -56,7 +56,7 @@ const db = fs.readFileSync(path.join(root, 'apps_script/Database.gs'), 'utf8');
 if (/INTERNAL_API_SECRET\s*=/.test(gas) || /setProperty\(['"]KUPI_API_SECRET['"]/.test(db)) fail('Найдено небезопасное встраивание/перезапись API-ключа.');
 if (!/getProperty\(['"]KUPI_API_SECRET['"]\)/.test(gas)) fail('Нет проверки сохранённого API-ключа Apps Script.');
 const actions = [...gas.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
-for (const action of ['formData','submitAd','uploadPhoto','searchAds','currentIssue','issueAds','purchaseRequest','feedback','adminStart','adminVerify','adminDashboard','adminDecision','adminGrant','adminCreateIssue','adminLogout']) {
+for (const action of ['formData','submitAd','uploadPhoto','searchAds','currentIssue','issueAds','purchaseRequest','feedback','publicNotice','adminSaveNotice','adminStart','adminVerify','adminDashboard','adminDecision','adminFeedback','adminGrant','adminMarkLinkSent','adminCreateIssue','adminLogout']) {
   if (!actions.includes(action)) fail('В API Apps Script отсутствует действие: ' + action);
 }
 const api = fs.readFileSync(path.join(root, 'netlify/functions/api.js'), 'utf8');
@@ -65,7 +65,65 @@ if (!/process\.env\.KUPI_API_SECRET/.test(api)) fail('API не читает KUPI
 if (!/DEFAULT_GAS_URL/.test(api)) fail('Не задан резервный URL Apps Script.');
 const issueFn = fs.readFileSync(path.join(root, 'netlify/functions/issue-ads.js'), 'utf8');
 if (!/require\(['"]\.\/api['"]\)/.test(issueFn) || !/api\.handler/.test(issueFn)) fail('Endpoint issue-ads не подключён к API gateway.');
+const paidPage = fs.readFileSync(path.join(root, 'site/search-issue.html'), 'utf8');
+const freePage = fs.readFileSync(path.join(root, 'site/free-issue.html'), 'utf8');
+if (/htmlBtn|pdfBtn|exportIssueHtml|printIssuePdf/.test(paidPage)) fail('В полном платном выпуске осталась функция скачивания или печати.');
+if (!/htmlBtn/.test(freePage) || !/pdfBtn/.test(freePage)) fail('Кнопки бесплатного выпуска должны оставаться без изменений.');
+if (!/kupi_paid_device_v1/.test(paidPage) || !/device_id/.test(paidPage)) fail('В платном выпуске не создаётся и не передаётся идентификатор браузера.');
+const payments = fs.readFileSync(path.join(root, 'apps_script/IssuesPayments.gs'), 'utf8');
+const admin = fs.readFileSync(path.join(root, 'apps_script/Admin.gs'), 'utf8');
+if (!/validAccess_\(p\.token,issue\.issue_id,p\.device_id\)/.test(payments) || !/access_device_id/.test(admin)) fail('Серверная привязка платной ссылки к первому браузеру не настроена.');
+if (!/access_device_id/.test(gas) || !/if\(last<headers\.length\)/.test(db)) fail('Не настроено безопасное добавление столбца привязки устройства в таблицу платежей.');
+for (const page of ['site/index.html','site/free-issue.html']) {
+  const html = fs.readFileSync(path.join(root, page), 'utf8');
+  if (!html.includes('Сначала переведите 500 ₸') || !html.includes('Я оплатил(а)')) fail('На странице покупки неверный порядок оплаты и отправки заявки: ' + page);
+}
+// Exercise the one-time browser binding with an in-memory payment sheet.
+const headers = ['request_id','issue_id','status','access_token','access_expires_at','access_device_id'];
+const rows = [headers, ['r1','i1','paid','token-test',new Date(Date.now()+60000),'']];
+const fakeSheet = {
+  getDataRange(){ return { getValues(){ return rows; } }; },
+  getRange(r,c){ return { setValue(v){ rows[r-1][c-1]=v; } }; }
+};
+const accessContext = { LockService:{ getScriptLock(){ return { waitLock(){}, releaseLock(){} }; } }, sheet_(){ return fakeSheet; } };
+vm.createContext(accessContext);
+vm.runInContext(admin, accessContext, {filename:'Admin.gs:device-binding-test'});
+const deviceA = 'a'.repeat(48), deviceB = 'b'.repeat(48);
+const firstOpen = accessContext.validAccess_('token-test','i1',deviceA);
+const sameBrowser = accessContext.validAccess_('token-test','i1',deviceA);
+const otherBrowser = accessContext.validAccess_('token-test','i1',deviceB);
+if (!firstOpen || !sameBrowser || otherBrowser || rows[1][5] !== deviceA || rows[1][2] !== 'activated') fail('Проверка привязки ссылки к первому браузеру не пройдена.');
+const sendRows = [
+  ['request_id','status','access_expires_at','access_token'],
+  ['req-send','paid',new Date(Date.now()+60000),'private-token']
+];
+const sendSheet = {
+  getDataRange(){ return { getValues(){ return sendRows; } }; },
+  getRange(r,c){ return { setValue(v){ sendRows[r-1][c-1]=v; } }; }
+};
+const sendContext = { LockService:{ getScriptLock(){ return { waitLock(){}, releaseLock(){} }; } }, sheet_(){ return sendSheet; } };
+vm.createContext(sendContext); vm.runInContext(admin, sendContext, {filename:'Admin.gs:one-time-send-test'});
+const marked = sendContext.adminMarkLinkSent_({request_id:'req-send'});
+let duplicateBlocked = false;
+try { sendContext.adminMarkLinkSent_({request_id:'req-send'}); } catch (_) { duplicateBlocked = true; }
+if (marked.status !== 'link_sent' || sendRows[1][1] !== 'link_sent' || !duplicateBlocked) fail('Повторная отправка WhatsApp не блокируется.');
+const adminPage = fs.readFileSync(path.join(root, 'site/admin.html'), 'utf8');
+if (!adminPage.includes('https://wa.me/') || !adminPage.includes('adminMarkLinkSent')) fail('В админке не настроена однократная передача ссылки в WhatsApp.');
+if (!adminPage.includes('+85294900674') || !adminPage.includes('p.phone')) fail('В админке не подтверждён номер отправителя или получатель из заявки.');
+if (!/if\(full&&current&&String\(issue\.issue_id\)!==String\(current\.issue_id\)\)/.test(payments)) fail('Платная ссылка не ограничена текущим выпуском.');
+// Verify that setupProject appends the new column without replacing old payment data.
+const oldPaymentHeaders = ['request_id','created_at','issue_id','issue_number','buyer_name','buyer_email','buyer_phone','amount','status','payment_reference','admin_note','access_token','access_expires_at','granted_at'];
+let migratedHeaders = oldPaymentHeaders.slice();
+const migrationSheet = {
+  getLastRow(){ return 2; },
+  getLastColumn(){ return migratedHeaders.length; },
+  getRange(r,c,n,m){ return { getDisplayValues(){ return [migratedHeaders.slice(c-1,c-1+m)]; }, setValues(v){ migratedHeaders.splice(c-1,v[0].length,...v[0]); } }; },
+  setFrozenRows(){}
+};
+const dbContext = {}; vm.createContext(dbContext); vm.runInContext(db, dbContext, {filename:'Database.gs:migration-test'});
+dbContext.ensureSupportSheet_({getSheetByName(){return migrationSheet;},insertSheet(){return migrationSheet;}},'Платежи',oldPaymentHeaders.concat('access_device_id'));
+if (migratedHeaders[migratedHeaders.length-1] !== 'access_device_id') fail('Миграция столбца access_device_id не прошла.');
 console.log('BUILD CHECK OK');
 console.log('Плоский GitHub-комплект: структура проекта восстановлена перед проверкой.');
-console.log('Проверено: 21 обязательный файл, 6 HTML-страниц, ссылки index.html на формы, перенаправление home.html, синтаксис 7 серверных JS-файлов, встроенные скрипты HTML, 15 API-действий, Netlify build/publish/functions и защита секрета.');
+console.log('Проверено: 21 обязательный файл, 6 HTML-страниц, маршруты, синтаксис серверных и браузерных скриптов, 19 API-действий, защита секрета, запрет скачивания платного выпуска, порядок оплаты и тест привязки ссылки к первому браузеру с миграцией таблицы.');
 console.log('Важно: живые Google/Netlify интеграции этим локальным тестом не проверяются.');

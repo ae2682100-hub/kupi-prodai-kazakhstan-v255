@@ -23,7 +23,7 @@ function setupProject_(){
   const triggerStatus=installWeeklyTrigger_();
   return {message:'Подключение выполнено. Исходные 7 листов проверены; служебные листы проверены/созданы; папка фото готова; расписание: '+triggerStatus+'.',spreadsheet_url:ss.getUrl(),drive_folder_id:props.getProperty('KUPI_DRIVE_FOLDER_ID'),weekly_trigger:triggerStatus};
 }
-function ensureSupportSheet_(ss,name,headers){let sh=ss.getSheetByName(name);if(!sh)sh=ss.insertSheet(name);if(sh.getLastRow()===0)sh.appendRow(headers);else{const got=sh.getRange(1,1,1,headers.length).getDisplayValues()[0];if(headers.some((x,i)=>got[i]!==x))throw new Error('Неверные заголовки служебного листа '+name);}sh.setFrozenRows(1);return sh;}
+function ensureSupportSheet_(ss,name,headers){let sh=ss.getSheetByName(name);if(!sh)sh=ss.insertSheet(name);if(sh.getLastRow()===0){sh.appendRow(headers);}else{const last=Math.max(1,sh.getLastColumn());const common=Math.min(last,headers.length);const got=sh.getRange(1,1,1,common).getDisplayValues()[0];if(headers.slice(0,common).some((x,i)=>got[i]!==x))throw new Error('Неверные заголовки служебного листа '+name);if(last<headers.length){const missing=headers.slice(last);sh.getRange(1,last+1,1,missing.length).setValues([missing]);}}sh.setFrozenRows(1);return sh;}
 function installWeeklyTrigger_(){const existing=ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='scheduledIssue');if(!existing)ScriptApp.newTrigger('scheduledIssue').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(6).nearMinute(0).inTimezone(CFG.TIMEZONE).create();return existing?'Уже установлен':'Установлен';}
 function scheduledIssue(){createIssue_(false);}
 function sheet_(name){const s=db_().getSheetByName(name);if(!s)throw new Error('Не найден лист '+name);return s;}
